@@ -1,5 +1,6 @@
 ./sql/admin/90_data.sql
 ./tenant_db/1.db
+go/cmd/isuports/isuports
 java/
 node/
 perl/
@@ -14,4 +15,3 @@ docker-compose-php.yml
 docker-compose-python.yml
 docker-compose-ruby.yml
 docker-compose-rust.yml
-

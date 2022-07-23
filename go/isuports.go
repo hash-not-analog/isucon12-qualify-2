@@ -13,6 +13,8 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/go-sql-driver/mysql"
 	"github.com/gofrs/flock"
@@ -44,7 +46,9 @@ var (
 	adminDB *sqlx.DB
 
 	sqliteDriverName = "sqlite3"
-	tenantDBs        = helpisu.NewCache[int64, *sqlx.DB]()
+	tenantDBCache    = helpisu.NewCache[int64, *sqlx.DB]()
+	dispenseMu       = sync.Mutex{}
+	curId            = int64(-1)
 )
 
 // 環境変数を取得する、なければデフォルト値を返す
@@ -77,7 +81,7 @@ func tenantDBPath(id int64) string {
 
 // テナントDBに接続する
 func connectToTenantDB(id int64) (*sqlx.DB, error) {
-	tenantDB, ok := tenantDBs.Get(id)
+	tenantDB, ok := tenantDBCache.Get(id)
 	if ok {
 		return tenantDB, nil
 	}
@@ -86,14 +90,17 @@ func connectToTenantDB(id int64) (*sqlx.DB, error) {
 	if err != nil {
 		return nil, fmt.Errorf("failed to open tenant DB: %w", err)
 	}
-	tenantDBs.Set(id, db)
+	tenantDBCache.Set(id, db)
 	return db, nil
 }
 
 // テナントDBを新規に作成する
 func createTenantDB(id int64) error {
-	p := tenantDBPath(id)
+	if _, ok := tenantDBCache.Get(id); ok {
+		return nil
+	}
 
+	p := tenantDBPath(id)
 	cmd := exec.Command("sh", "-c", fmt.Sprintf("sqlite3 %s < %s", p, tenantDBSchemaFilePath))
 	if out, err := cmd.CombinedOutput(); err != nil {
 		return fmt.Errorf("failed to exec sqlite3 %s < %s, out=%s: %w", p, tenantDBSchemaFilePath, string(out), err)
@@ -104,28 +111,20 @@ func createTenantDB(id int64) error {
 // システム全体で一意なIDを生成する
 // これMutexと加算で置き換えられる
 func dispenseID(ctx context.Context) (string, error) {
-	var id int64
-	var lastErr error
-	for i := 0; i < 100; i++ {
-		var ret sql.Result
-		ret, err := adminDB.ExecContext(ctx, "REPLACE INTO id_generator (stub) VALUES (?);", "a")
-		if err != nil {
-			if merr, ok := err.(*mysql.MySQLError); ok && merr.Number == 1213 { // deadlock
-				lastErr = fmt.Errorf("error REPLACE INTO id_generator: %w", err)
-				continue
-			}
-			return "", fmt.Errorf("error REPLACE INTO id_generator: %w", err)
-		}
-		id, err = ret.LastInsertId()
-		if err != nil {
-			return "", fmt.Errorf("error ret.LastInsertId: %w", err)
-		}
-		break
+	if curId == -1 {
+		adminDB.Get(curId, "SELECT id FROM id_generator WHERE stub='a';")
 	}
-	if id != 0 {
-		return fmt.Sprintf("%x", id), nil
-	}
-	return "", lastErr
+	dispenseMu.Lock()
+	curId += 1
+	dispenseMu.Unlock()
+	return fmt.Sprintf("%x", curId), nil
+}
+
+func dispenseUpdate() {
+	t := time.NewTicker(90 * time.Second)
+	defer t.Stop()
+	<-t.C
+	adminDB.Exec("UPDATE id_generator SET id = ?, stub=?;", curId, "a")
 }
 
 // 全APIにCache-Control: privateを設定する
@@ -404,12 +403,17 @@ type PlayerRow struct {
 	UpdatedAt      int64  `db:"updated_at"`
 }
 
+var playerCache = helpisu.NewCache[string, PlayerRow]()
+
 // 参加者を取得する
 func retrievePlayer(ctx context.Context, tenantDB dbOrTx, id string) (*PlayerRow, error) {
-	var p PlayerRow
-	if err := tenantDB.GetContext(ctx, &p, "SELECT * FROM player WHERE id = ?", id); err != nil {
-		return nil, fmt.Errorf("error Select player: id=%s, %w", id, err)
+	p, ok := playerCache.Get(id)
+	if !ok {
+		if err := tenantDB.GetContext(ctx, &p, "SELECT * FROM player WHERE id = ?", id); err != nil {
+			return nil, fmt.Errorf("error Select player: id=%s, %w", id, err)
+		}
 	}
+	playerCache.Set(id, p)
 	return &p, nil
 }
 
@@ -443,7 +447,7 @@ var competitionCache = helpisu.NewCache[string, CompetitionRow]()
 // 大会を取得する
 func retrieveCompetition(ctx context.Context, tenantDB dbOrTx, id string) (*CompetitionRow, error) {
 	c, ok := competitionCache.Get(id)
-	if ok {
+	if !ok {
 		if err := tenantDB.GetContext(ctx, &c, "SELECT * FROM competition WHERE id = ?", id); err != nil {
 			return nil, fmt.Errorf("error Select competition: id=%s, %w", id, err)
 		}
@@ -490,24 +494,32 @@ type InitializeHandlerResult struct {
 // ベンチマーカーが起動したときに最初に呼ぶ
 // データベースの初期化などが実行されるため、スキーマを変更した場合などは適宜改変すること
 func initializeHandler(c echo.Context) error {
-	for i := 0; i < 100; i++ {
-		tenantDB, ok := tenantDBs.Get(int64(i))
-		if ok {
-			tenantDB.Close()
-		}
-	}
-	tenantDBs.Reset()
+	var tenantNum int
+	adminDB.GetContext(c.Request().Context(), &tenantNum, "SELECT count(*) FROM tenant")
 
 	out, err := exec.Command(initializeScript).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("error exec.Command: %s %e", string(out), err)
 	}
+
+	for i := 1; i < tenantNum; i++ {
+		tenantDB, ok := tenantDBCache.Get(int64(i))
+		if ok {
+			tenantDB.Close()
+		}
+	}
+
+	tenantDBCache.Reset()
+	jwtKeyCache.Reset()
+	jwtTokenCache.Reset()
+	playerCache.Reset()
+	competitionCache.Reset()
+	tenantCache.Reset()
+
+	go dispenseUpdate()
+
 	res := InitializeHandlerResult{
 		Lang: "go",
 	}
-
-	jwtKeyCache.Reset()
-	jwtTokenCache.Reset()
-
 	return c.JSON(http.StatusOK, SuccessResult{Status: true, Data: res})
 }
